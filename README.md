@@ -1,0 +1,1 @@
+Pipeline script for generating SBOM files by Trivy and import SBOM files to Dependency-Track for SBOM management
