@@ -1,0 +1,37 @@
+trigger:
+- main
+
+pool:
+  name: 'POC-SBOM'
+
+variables:
+  PROJECT_NAME: 'Webviz-TFS'
+  PROJECT_VERSION: '1.0'
+  TRIVY_IMAGE: "aquasec/trivy:latest"
+  SBOM_FILE: "sbom.json"
+  DTRACK_API_URL: "...."
+  DTRACK_API_KEY: "...."
+  ACCESS_TEAM: "[]"
+  TAGS: "[]"
+  DESCRIPTION: "test description"
+  CLASSIFIER: "APPLICATION"
+  SEVERITY: "CRITICAL"
+
+stages:
+- stage: Pre_build_security_scan
+  jobs:
+  - job: SCA_pre_build
+    steps:
+    - script: |
+        # trivy fs --scanners vuln --severity $(SEVERITY) --exit-code 1 .
+        trivy fs --scanners vuln --severity $(SEVERITY) .
+      displayName: "🔍 Scan Vulnerabilities from source code"
+
+- stage: Build
+  dependsOn: Pre_build_security_scan
+  jobs:
+  - job: BuildContainer
+    steps:
+    - script: |
+        docker pull cruise/webviz
+      displayName: "🛠️ Build & Push Image"

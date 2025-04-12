@@ -1,0 +1,199 @@
+trigger:
+- main
+
+pool:
+  name: 'Trivy'  # Hoặc sử dụng self-hosted agent
+
+variables:
+  PROJECT_NAME: 'Webviz'
+  PROJECT_VERSION: '1.1'
+  TRIVY_IMAGE: "aquasec/trivy:latest"
+  SBOM_FILE: "sbom.json"
+  DTRACK_API_URL: "..."
+  DTRACK_API_KEY: "..."  # Lưu API Key trong Azure DevOps Secrets
+  ACCESS_TEAM: "[]"
+  TAGS: "[]"
+  DESCRIPTION: "test description"
+  CLASSIFIER: "APPLICATION"
+  SEVERITY: "CRITICAL"
+
+stages:
+- stage: Pre_build_security_scan
+  jobs:
+  - job: SCA_pre_build
+    steps:
+    - script: |
+        # trivy fs --scanners vuln --severity $(SEVERITY) --exit-code 1 .
+        trivy fs --scanners vuln --severity $(SEVERITY) .
+      displayName: "🔍 Scan Vulnerabilities from source code"
+
+- stage: Build
+  dependsOn: Pre_build_security_scan
+  jobs:
+  - job: BuildContainer
+    steps:
+    - script: |
+        docker pull cruise/webviz
+      displayName: "🛠️ Build & Push Image"
+
+
+- stage: Post_build_security_scan
+  dependsOn: Build
+  jobs:
+  - job: image_scan
+    steps:
+    - script: |
+        # trivy image --scanners vuln,misconfig --severity $(SEVERITY) --exit-code 1 cruise/webviz:latest
+        trivy image --scanners vuln,misconfig --severity $(SEVERITY) cruise/webviz:latest
+      displayName: "🔍 Scan Vulnerabilities, misconfig from image SBOM"
+- stage: SBOM_management
+  dependsOn: Post_build_security_scan
+  jobs:
+  - job: sbom_generation
+    steps:
+    - script: |
+        trivy fs --format cyclonedx --output source-$(SBOM_FILE) .
+      displayName: "📦 Generate SBOM from source code"
+    - script: |
+        trivy image --format cyclonedx --output image-$(SBOM_FILE) cruise/webviz:latest
+      displayName: "📦 Generate SBOM from image"
+    - script: |
+        echo "📦 Creating or Retrieving source Project UUID..."
+        PROJECT_PAYLOAD=$(jq -n \
+          --arg name "$(PROJECT_NAME)-source" \
+          --arg version "$(PROJECT_VERSION)" \
+          --arg description "$(DESCRIPTION)" \
+          --arg classifier "$(CLASSIFIER)" \
+          --argjson accessTeams "$(ACCESS_TEAM)" \
+          --argjson tags "$(TAGS)" \
+          '{
+            name: $name,
+            version: $version,
+            description: $description,
+            parent: null,
+            classifier: $classifier,
+            accessTeams: $accessTeams,
+            tags: $tags,
+            active: true,
+            isLatest: false
+          }')
+        RESPONSE=$(curl -s -X PUT "$(DTRACK_API_URL)/api/v1/project" \
+          -H "X-Api-Key: $(DTRACK_API_KEY)" \
+          -H "Content-Type: application/json" \
+          -d "$PROJECT_PAYLOAD")
+
+        if echo "$RESPONSE" | grep -q '"uuid"'; then
+          echo "New project"
+          PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.uuid')
+        else
+          echo "Project exist"
+          RESPONSE=$(curl -s -X GET "$(DTRACK_API_URL)/api/v1/project?name=$(echo -n "${PROJECT_NAME}-source" | jq -sRr @uri)" \
+            -H "X-Api-Key: $(DTRACK_API_KEY)" \
+            -H "Content-Type: application/json")
+          PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.[0].uuid')
+        fi
+        if [[ -z "$PROJECT_UUID" || "$PROJECT_UUID" == "null" ]]; then
+          echo "❌ Error: Project UUID is empty. Stopping pipeline."
+          exit 1
+        else
+          echo "✅ Source Project UUID: $PROJECT_UUID"
+        fi
+        echo "##vso[task.setvariable variable=PROJECT_UUID]$PROJECT_UUID"
+      displayName: "🚀 Create source Project in Dependency-Track"
+    - script: |
+        echo "📤 Uploading source code SBOM to Dependency-Track..."
+        BASE64_SBOM=$(base64 -w 0 "$(pwd)/source-$(SBOM_FILE)")
+
+        # Tạo payload JSON trong file tạm để tránh lỗi do kích thước lớn
+        echo "{\"project\": \"$(PROJECT_UUID)\", \"bom\": \"$BASE64_SBOM\"}" > payload-$(SBOM_FILE)
+
+        # Gửi request upload SBOM
+        RESPONSE=$(curl -s -X "PUT" "$(DTRACK_API_URL)/api/v1/bom" \
+          -H "X-Api-Key: $(DTRACK_API_KEY)" \
+          -H "Content-Type: application/json" \
+          --data @payload-$(SBOM_FILE))
+
+        echo "Response: $RESPONSE"
+
+        # Kiểm tra phản hồi từ API
+        if echo "$RESPONSE" | grep -q '"token"'; then
+          echo "✅ Source code SBOM uploaded successfully!"
+        else
+          echo "❌ Error uploading source code SBOM"
+          exit 1
+        fi
+      displayName: "📤 Upload source code SBOM to Dependency-Track"
+    - script: |
+        echo "📦 Creating or Retrieving Image Project UUID..."
+        PROJECT_PAYLOAD=$(jq -n \
+          --arg name "$(PROJECT_NAME)-image" \
+          --arg version "$(PROJECT_VERSION)" \
+          --arg description "$(DESCRIPTION)" \
+          --arg classifier "$(CLASSIFIER)" \
+          --argjson accessTeams "$(ACCESS_TEAM)" \
+          --argjson tags "$(TAGS)" \
+          '{
+            name: $name,
+            version: $version,
+            description: $description,
+            parent: null,
+            classifier: $classifier,
+            accessTeams: $accessTeams,
+            tags: $tags,
+            active: true,
+            isLatest: false
+          }')
+        RESPONSE=$(curl -s -X PUT "$(DTRACK_API_URL)/api/v1/project" \
+          -H "X-Api-Key: $(DTRACK_API_KEY)" \
+          -H "Content-Type: application/json" \
+          -d "$PROJECT_PAYLOAD")
+
+        if echo "$RESPONSE" | grep -q '"uuid"'; then
+          echo "New project"
+          PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.uuid')
+        else
+          echo "Project exist"
+          RESPONSE=$(curl -s -X GET "$(DTRACK_API_URL)/api/v1/project?name=$(echo -n "${PROJECT_NAME}-image" | jq -sRr @uri)" \
+            -H "X-Api-Key: $(DTRACK_API_KEY)" \
+            -H "Content-Type: application/json")
+          PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.[0].uuid')
+        fi
+        if [[ -z "$PROJECT_UUID" || "$PROJECT_UUID" == "null" ]]; then
+          echo "❌ Error: Project UUID is empty. Stopping pipeline."
+          exit 1
+        else
+          echo "✅ Image Project UUID: $PROJECT_UUID"
+        fi
+        echo "##vso[task.setvariable variable=PROJECT_UUID]$PROJECT_UUID"
+      displayName: "🚀 Create Image Project in Dependency-Track"
+    - script: |
+        echo "📤 Uploading image SBOM to Dependency-Track..."
+        BASE64_SBOM=$(base64 -w 0 "$(pwd)/image-$(SBOM_FILE)")
+
+        # Tạo payload JSON trong file tạm để tránh lỗi do kích thước lớn
+        echo "{\"project\": \"$(PROJECT_UUID)\", \"bom\": \"$BASE64_SBOM\"}" > payload-$(SBOM_FILE)
+
+        # Gửi request upload SBOM
+        RESPONSE=$(curl -s -X "PUT" "$(DTRACK_API_URL)/api/v1/bom" \
+          -H "X-Api-Key: $(DTRACK_API_KEY)" \
+          -H "Content-Type: application/json" \
+          --data @payload-$(SBOM_FILE))
+
+        echo "Response: $RESPONSE"
+
+        # Kiểm tra phản hồi từ API
+        if echo "$RESPONSE" | grep -q '"token"'; then
+          echo "✅ Image SBOM uploaded successfully!"
+        else
+          echo "❌ Error uploading image SBOM"
+          exit 1
+        fi
+      displayName: "📤 Upload image SBOM to Dependency-Track"
+- stage: Deploy
+  dependsOn: SBOM_management
+  jobs:
+  - job: Deploycontainer
+    steps:
+    - script: |
+        echo "Deploy"
+      displayName: "🚀 Deploy"

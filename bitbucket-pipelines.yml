@@ -1,0 +1,227 @@
+pipelines:
+  branches:
+    main: 
+      - step:
+          name: "Pre-build Security Scan"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - trivy fs --scanners vuln --severity $SEVERITY --exit-code 1 .
+      - step:
+          name: "Post-build Security Scan"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - trivy image --scanners vuln,misconfig --severity $SEVERITY --exit-code 1 cruise/webviz:latest
+      - step:
+          name: "Build"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "add your build image script"
+      - step:
+          name: "SBOM Generation from Source"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "Generating source SBOM file..."
+            - mkdir -p artifacts
+            - trivy fs --format cyclonedx --output ./artifacts/source-sbom.json .
+            - ls -la ./artifacts/
+            - |
+              echo "SBOM file generated at: $(pwd)/artifacts/source-sbom.json"
+            - cat ./artifacts/source-sbom.json | head -10
+          artifacts:
+            - artifacts/**
+      - step:
+          name: "SBOM Generation from Image"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "Generating image SBOM file..."
+            - mkdir -p artifacts
+            - trivy image --format cyclonedx --output ./artifacts/image-sbom.json cruise/webviz:latest
+            - ls -la ./artifacts/
+            - |
+              echo "SBOM file generated at: $(pwd)/artifacts/image-sbom.json"
+            - cat ./artifacts/image-sbom.json | head -10
+          artifacts:
+            - artifacts/**
+      - step:
+          name: "Create Source Project in Dependency-Track"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "📦 Creating or Retrieving source Project UUID..."
+            - ls -la
+            - ls -la ./artifacts/
+            - |
+              PROJECT_PAYLOAD=$(jq -n \
+                --arg name "$PROJECT_NAME-source" \
+                --arg version "$PROJECT_VERSION" \
+                --arg description "$DESCRIPTION" \
+                --arg classifier "$CLASSIFIER" \
+                --argjson accessTeams "$ACCESS_TEAM" \
+                --argjson tags "$TAGS" \
+                '{
+                  name: $name,
+                  version: $version,
+                  description: $description,
+                  parent: null,
+                  classifier: $classifier,
+                  accessTeams: $accessTeams,
+                  tags: $tags,
+                  active: true,
+                  isLatest: false
+                }')
+            - |
+              RESPONSE=$(curl -s -X PUT "$DTRACK_API_URL/api/v1/project" \
+                -H "X-Api-Key: $DTRACK_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "$PROJECT_PAYLOAD")
+            - |
+              if echo "$RESPONSE" | grep -q '"uuid"'; then
+                echo "New project"
+                PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.uuid')
+              else
+                echo "Project exist"
+                RESPONSE=$(curl -s -X GET "$DTRACK_API_URL/api/v1/project?name=$(echo -n "${PROJECT_NAME}-source" | jq -sRr @uri)" \
+                  -H "X-Api-Key: $DTRACK_API_KEY" \
+                  -H "Content-Type: application/json")
+                PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.[0].uuid')
+              fi
+            - |
+              if [[ -z "$PROJECT_UUID" || "$PROJECT_UUID" == "null" ]]; then
+                echo "❌ Error: Project UUID is empty. Stopping pipeline."
+                exit 1
+              else
+                echo "✅ Source Project UUID: $PROJECT_UUID"
+              fi
+            - echo "$PROJECT_UUID" > ./artifacts/source-project-uuid.txt
+          artifacts:
+            - artifacts/**
+      - step:
+          name: "Upload Source SBOM to Dependency-Track"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "📤 Uploading source code SBOM to Dependency-Track..."
+            - ls -la
+            - ls -la ./artifacts/
+            - SOURCE_PROJECT_UUID=$(cat ./artifacts/source-project-uuid.txt)
+            - |
+              echo "Using Project UUID: $SOURCE_PROJECT_UUID"
+            - cat ./artifacts/source-sbom.json | head -5
+            - BASE64_SBOM=$(base64 -w 0 ./artifacts/source-sbom.json)
+            - |
+              echo "{\"project\": \"$SOURCE_PROJECT_UUID\", \"bom\": \"$BASE64_SBOM\"}" > ./artifacts/payload-source-sbom.json
+            - |
+              RESPONSE=$(curl -s -X "PUT" "$DTRACK_API_URL/api/v1/bom" \
+                -H "X-Api-Key: $DTRACK_API_KEY" \
+                -H "Content-Type: application/json" \
+                --data @./artifacts/payload-source-sbom.json)
+            - |
+              echo "Response: $RESPONSE"
+            - |
+              if echo "$RESPONSE" | grep -q '"token"'; then
+                echo "✅ Source code SBOM uploaded successfully!"
+              else
+                echo "❌ Error uploading source code SBOM"
+                exit 1
+              fi
+      - step:
+          name: "Create Image Project in Dependency-Track"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "📦 Creating or Retrieving Image Project UUID..."
+            - ls -la ./artifacts/
+            - |
+              PROJECT_PAYLOAD=$(jq -n \
+                --arg name "$PROJECT_NAME-image" \
+                --arg version "$PROJECT_VERSION" \
+                --arg description "$DESCRIPTION" \
+                --arg classifier "$CLASSIFIER" \
+                --argjson accessTeams "$ACCESS_TEAM" \
+                --argjson tags "$TAGS" \
+                '{
+                  name: $name,
+                  version: $version,
+                  description: $description,
+                  parent: null,
+                  classifier: $classifier,
+                  accessTeams: $accessTeams,
+                  tags: $tags,
+                  active: true,
+                  isLatest: false
+                }')
+            - |
+              RESPONSE=$(curl -s -X PUT "$DTRACK_API_URL/api/v1/project" \
+                -H "X-Api-Key: $DTRACK_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "$PROJECT_PAYLOAD")
+            - |
+              if echo "$RESPONSE" | grep -q '"uuid"'; then
+                echo "New project"
+                PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.uuid')
+              else
+                echo "Project exist"
+                RESPONSE=$(curl -s -X GET "$DTRACK_API_URL/api/v1/project?name=$(echo -n "${PROJECT_NAME}-image" | jq -sRr @uri)" \
+                  -H "X-Api-Key: $DTRACK_API_KEY" \
+                  -H "Content-Type: application/json")
+                PROJECT_UUID=$(echo "$RESPONSE" | jq -r '.[0].uuid')
+              fi
+            - |
+              if [[ -z "$PROJECT_UUID" || "$PROJECT_UUID" == "null" ]]; then
+                echo "❌ Error: Project UUID is empty. Stopping pipeline."
+                exit 1
+              else
+                echo "✅ Image Project UUID: $PROJECT_UUID"
+              fi
+            - echo "$PROJECT_UUID" > ./artifacts/image-project-uuid.txt
+          artifacts:
+            - artifacts/**
+      - step:
+          name: "Upload Image SBOM to Dependency-Track"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "📤 Uploading image SBOM to Dependency-Track..."
+            - ls -la ./artifacts/
+            - IMAGE_PROJECT_UUID=$(cat ./artifacts/image-project-uuid.txt)
+            - |
+              echo "Using Project UUID: $IMAGE_PROJECT_UUID"
+            - cat ./artifacts/image-sbom.json | head -5
+            - BASE64_SBOM=$(base64 -w 0 ./artifacts/image-sbom.json)
+            - |
+              echo "{\"project\": \"$IMAGE_PROJECT_UUID\", \"bom\": \"$BASE64_SBOM\"}" > ./artifacts/payload-image-sbom.json
+            - |
+              RESPONSE=$(curl -s -X "PUT" "$DTRACK_API_URL/api/v1/bom" \
+                -H "X-Api-Key: $DTRACK_API_KEY" \
+                -H "Content-Type: application/json" \
+                --data @./artifacts/payload-image-sbom.json)
+            - |
+              echo "Response: $RESPONSE"
+            - |
+              if echo "$RESPONSE" | grep -q '"token"'; then
+                echo "✅ Image SBOM uploaded successfully!"
+              else
+                echo "❌ Error uploading image SBOM"
+                exit 1
+              fi
+      - step:
+          name: "Deploy"
+          runs-on:
+            - self.hosted
+            - linux.shell
+          script:
+            - echo "Deploy"
